@@ -1,0 +1,139 @@
+name: Release Action
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: >
+          Version to release (e.g. v1.2.3).
+          Leave blank to auto-increment the latest patch version.
+        required: false
+        default: ''
+      force:
+        description: >
+          Overwrite an existing tag and release at this version.
+          Use for bug fixes that do not change inputs or outputs.
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0   # full tag history required for version resolution
+
+      # ── 1. Resolve version ──────────────────────────────────────────────────
+      - name: Resolve version
+        id: ver
+        run: |
+          set -euo pipefail
+
+          INPUT="${{ inputs.version }}"
+
+          # Find the highest existing semver tag.
+          LATEST=$(git tag -l 'v[0-9]*.[0-9]*.[0-9]*' | sort -V | tail -1)
+
+          if [ -z "$LATEST" ]; then
+            COMPUTED="v1.0.0"
+          else
+            IFS='.' read -r VMAJ VMIN VPAT <<< "${LATEST#v}"
+            COMPUTED="v${VMAJ}.${VMIN}.$((VPAT + 1))"
+          fi
+
+          VERSION="${INPUT:-$COMPUTED}"
+
+          if ! [[ "$VERSION" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::Version '$VERSION' must match vMAJOR.MINOR.PATCH (e.g. v1.2.3)"
+            exit 1
+          fi
+
+          MAJOR="v$(echo "$VERSION" | cut -d. -f1 | tr -d 'v')"
+
+          echo "version=$VERSION"   >> "$GITHUB_OUTPUT"
+          echo "major=$MAJOR"       >> "$GITHUB_OUTPUT"
+          echo "previous=$LATEST"   >> "$GITHUB_OUTPUT"
+
+          echo "=== Version resolution ==="
+          echo "  Input:    ${INPUT:-(none — using auto-computed)}"
+          echo "  Computed: $COMPUTED"
+          echo "  Using:    $VERSION"
+          echo "  Float:    $MAJOR"
+          echo "  Previous: ${LATEST:-(none)}"
+
+      # ── 2. Guard against accidental overwrites ──────────────────────────────
+      - name: Check for existing tag
+        id: exists
+        run: |
+          V="${{ steps.ver.outputs.version }}"
+          if git rev-parse "$V" >/dev/null 2>&1; then
+            echo "found=true"  >> "$GITHUB_OUTPUT"
+            echo "::notice::Tag $V already exists"
+          else
+            echo "found=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Fail if tag exists and force is false
+        if: steps.exists.outputs.found == 'true' && inputs.force == false
+        run: |
+          echo "::error::Tag ${{ steps.ver.outputs.version }} already exists. Enable 'force' to overwrite."
+          exit 1
+
+      # ── 3. Tear down existing release/tag when force is true ────────────────
+      - name: Remove existing release and tag
+        if: steps.exists.outputs.found == 'true' && inputs.force == true
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          V="${{ steps.ver.outputs.version }}"
+          # --cleanup-tag deletes both the GitHub Release and the remote tag.
+          gh release delete "$V" --yes --cleanup-tag 2>/dev/null || true
+          git tag -d "$V" 2>/dev/null || true
+
+      # ── 4. Tag HEAD ─────────────────────────────────────────────────────────
+      - name: Create version tag
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git tag -a "${{ steps.ver.outputs.version }}" \
+            -m "Release ${{ steps.ver.outputs.version }}"
+          git push origin "${{ steps.ver.outputs.version }}"
+
+      # ── 5. Move floating major tag (e.g. v1 → current commit) ───────────────
+      - name: Update floating major tag
+        run: |
+          M="${{ steps.ver.outputs.major }}"
+          git tag -f "$M"
+          git push origin "$M" --force
+          echo "::notice::Floating tag $M updated to $(git rev-parse --short HEAD)"
+
+      # ── 6. Create GitHub Release ─────────────────────────────────────────────
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          V="${{ steps.ver.outputs.version }}"
+          PREV="${{ steps.ver.outputs.previous }}"
+          FORCE="${{ inputs.force }}"
+
+          NOTES_ARGS=""
+          if [ -n "$PREV" ] && [ "$PREV" != "$V" ]; then
+            NOTES_ARGS="--generate-notes --notes-start-tag $PREV"
+          fi
+
+          TITLE="$V"
+          if [ "$FORCE" = "true" ]; then
+            TITLE="$V (re-release)"
+          fi
+
+          # shellcheck disable=SC2086
+          gh release create "$V" \
+            --title "$TITLE" \
+            $NOTES_ARGS
+
+          echo "::notice::Release $V published — https://github.com/${{ github.repository }}/releases/tag/$V"
