@@ -1,0 +1,151 @@
+name: Resolve runner
+description: >
+  Checks whether any self-hosted runner matching the requested labels is
+  currently online and idle. Outputs the requested labels if a match is
+  found, or the fallback labels otherwise. Always runs on the calling
+  job's runner (use ubuntu-latest for the check-runner job itself).
+
+branding:
+  icon: 'server'
+  color: 'blue'
+
+inputs:
+  labels:
+    description: >
+      Preferred runner labels as a JSON array string,
+      e.g. '["self-hosted","macos-14"]'. Passed directly to runs-on
+      via fromJSON() in the calling workflow.
+    required: true
+  fallback:
+    description: >
+      Fallback labels JSON array string used when no matching runner is
+      online and idle.
+    required: false
+    default: '["ubuntu-latest"]'
+  token:
+    description: >
+      Token used to query the runners API. Defaults to github.token,
+      which can list repo-level runners (requires administration:read
+      workflow permission) but cannot list org-level runners.
+      Pass a classic PAT with admin:org scope to detect runners
+      registered at the organisation level.
+    required: false
+    default: ${{ github.token }}
+  wait_if_busy:
+    description: >
+      When 'true', returns the requested labels even if all matching runners
+      are currently busy, allowing GitHub to queue the job until one becomes
+      free. When 'false' (default), falls back immediately to the fallback
+      labels if no matching runner is idle.
+    required: false
+    default: 'false'
+  scope:
+    description: >
+      Controls which runners API endpoint is queried.
+        auto — try org-level first, fall back to repo-level (default)
+        org  — query org-level only; fails with an error if the API is
+               unreachable (requires a token with admin:org scope)
+        repo — query repo-level only; works with the default github.token
+    required: false
+    default: 'auto'
+
+outputs:
+  runner:
+    description: >
+      Resolved labels JSON array string. Use with fromJSON() in runs-on.
+    value: ${{ steps.resolve.outputs.runner }}
+  match_status:
+    description: >
+      Outcome of the runner lookup. One of:
+        matched     — a matching runner is online and idle
+        busy        — matching runner(s) exist and are online but all occupied
+        offline     — no matching runner is registered or online
+        unavailable — the runners API could not be reached
+    value: ${{ steps.resolve.outputs.match_status }}
+
+runs:
+  using: composite
+  steps:
+    - name: Resolve runner availability
+      id: resolve
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.token }}
+        LABELS: ${{ inputs.labels }}
+        FALLBACK: ${{ inputs.fallback }}
+        WAIT_IF_BUSY: ${{ inputs.wait_if_busy }}
+        SCOPE: ${{ inputs.scope }}
+      run: |
+        # If labels and fallback are identical there is nothing to check.
+        if [ "$LABELS" = "$FALLBACK" ]; then
+          echo "match_status=matched" >> "$GITHUB_OUTPUT"
+          echo "runner=$LABELS" >> "$GITHUB_OUTPUT"
+          exit 0
+        fi
+
+        ORG="${GITHUB_REPOSITORY%%/*}"
+
+        if [ "$SCOPE" = "org" ]; then
+          RUNNERS=$(gh api "/orgs/${ORG}/actions/runners" 2>/dev/null) || {
+            echo "::error::Org runners API unavailable — verify token has admin:org scope"
+            echo "match_status=unavailable" >> "$GITHUB_OUTPUT"
+            echo "runner=$FALLBACK" >> "$GITHUB_OUTPUT"
+            exit 1
+          }
+        elif [ "$SCOPE" = "repo" ]; then
+          RUNNERS=$(gh api "/repos/${GITHUB_REPOSITORY}/actions/runners" 2>/dev/null) || {
+            echo "::warning::Repo runners API unavailable — falling back to $FALLBACK"
+            echo "match_status=unavailable" >> "$GITHUB_OUTPUT"
+            echo "runner=$FALLBACK" >> "$GITHUB_OUTPUT"
+            exit 0
+          }
+        else
+          # auto: try org-level first, fall back to repo-level
+          RUNNERS=$(gh api "/orgs/${ORG}/actions/runners" 2>/dev/null) || \
+            RUNNERS=$(gh api "/repos/${GITHUB_REPOSITORY}/actions/runners" 2>/dev/null) || {
+            echo "::warning::Runners API unavailable — falling back to $FALLBACK"
+            echo "match_status=unavailable" >> "$GITHUB_OUTPUT"
+            echo "runner=$FALLBACK" >> "$GITHUB_OUTPUT"
+            exit 0
+          }
+        fi
+
+        # Check for an online + idle match (case-insensitive label comparison).
+        IDLE_MATCH=$(printf '%s' "$RUNNERS" | jq --argjson required "$LABELS" '
+          [.runners[] |
+            select(
+              .status == "online" and
+              .busy   == false    and
+              ((($required | map(ascii_downcase)) - (.labels | map(.name | ascii_downcase))) | length == 0)
+            )
+          ] | length > 0
+        ')
+
+        # Check for an online + busy match (runner exists but currently occupied).
+        BUSY_MATCH=$(printf '%s' "$RUNNERS" | jq --argjson required "$LABELS" '
+          [.runners[] |
+            select(
+              .status == "online" and
+              .busy   == true     and
+              ((($required | map(ascii_downcase)) - (.labels | map(.name | ascii_downcase))) | length == 0)
+            )
+          ] | length > 0
+        ')
+
+        if [ "$IDLE_MATCH" = "true" ]; then
+          echo "::notice::Self-hosted runner available — using $LABELS"
+          echo "match_status=matched" >> "$GITHUB_OUTPUT"
+          echo "runner=$LABELS" >> "$GITHUB_OUTPUT"
+        elif [ "$BUSY_MATCH" = "true" ] && [ "$WAIT_IF_BUSY" = "true" ]; then
+          echo "::notice::Self-hosted runner busy — queuing on $LABELS (wait_if_busy=true)"
+          echo "match_status=busy" >> "$GITHUB_OUTPUT"
+          echo "runner=$LABELS" >> "$GITHUB_OUTPUT"
+        elif [ "$BUSY_MATCH" = "true" ]; then
+          echo "::notice::Self-hosted runner busy — falling back to $FALLBACK (wait_if_busy=false)"
+          echo "match_status=busy" >> "$GITHUB_OUTPUT"
+          echo "runner=$FALLBACK" >> "$GITHUB_OUTPUT"
+        else
+          echo "::notice::No matching runner online — falling back to $FALLBACK"
+          echo "match_status=offline" >> "$GITHUB_OUTPUT"
+          echo "runner=$FALLBACK" >> "$GITHUB_OUTPUT"
+        fi

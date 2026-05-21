@@ -1,0 +1,46 @@
+services:
+  github-runner-myorg-1:
+    image: ghcr.io/pinnacledigital/github-runner:latest
+    build: .
+    restart: always
+    environment:
+      RUNNER_SCOPE: org
+      ORG_NAME: ${ORG_NAME}
+      GITHUB_PAT: ${GITHUB_PAT}
+      RUNNER_NAME: amd64-${ORG_NAME}-1
+      LABELS: self-hosted,Linux,amd64,android
+      EPHEMERAL: "true"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - gradle-cache:/root/.gradle/caches
+      - gradle-wrapper:/root/.gradle/wrapper
+      - npm-cache:/root/.npm
+      - runner-state:/var/run/github-runner
+
+  # Add one service block per additional org or repo.
+  # Each service needs its own ORG_NAME env var — add a distinct variable
+  # to .env for each (e.g. SECOND_ORG_NAME) and reference it here.
+  #
+  # github-runner-mysecondorg-1:
+  #   image: ghcr.io/pinnacledigital/github-runner:latest
+  #   build: .
+  #   restart: always
+  #   environment:
+  #     RUNNER_SCOPE: org
+  #     ORG_NAME: ${SECOND_ORG_NAME}
+  #     GITHUB_PAT: ${GITHUB_PAT}
+  #     RUNNER_NAME: amd64-${SECOND_ORG_NAME}-1
+  #     LABELS: self-hosted,Linux,amd64,android
+  #     EPHEMERAL: "true"
+  #   volumes:
+  #     - /var/run/docker.sock:/var/run/docker.sock
+  #     - gradle-cache:/root/.gradle/caches
+  #     - gradle-wrapper:/root/.gradle/wrapper
+  #     - npm-cache:/root/.npm
+  #     - runner-state:/var/run/github-runner
+
+volumes:
+  gradle-cache:
+  gradle-wrapper:
+  npm-cache:
+  runner-state:
