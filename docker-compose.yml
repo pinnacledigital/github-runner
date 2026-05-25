@@ -1,5 +1,7 @@
 services:
   github-runner-myorg-1:
+    # Built internally for android builds using Dockerfile.android:
+    # so imageL ghcr.io/pinnacledigital/github-runner:android
     image: ghcr.io/pinnacledigital/github-runner:latest
     build: .
     restart: always
@@ -22,7 +24,7 @@ services:
   # to .env for each (e.g. SECOND_ORG_NAME) and reference it here.
   #
   # github-runner-mysecondorg-1:
-  #   image: ghcr.io/pinnacledigital/github-runner:latest
+  #   image: ghcr.io/pinnacledigital/github-runner:android
   #   build: .
   #   restart: always
   #   environment:

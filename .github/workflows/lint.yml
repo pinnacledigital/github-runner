@@ -1,0 +1,33 @@
+name: Lint Shell Scripts
+
+on:
+  push:
+    branches: [master]
+    paths:
+      - '**/*.sh'
+  pull_request:
+    branches: [master]
+    paths:
+      - '**/*.sh'
+  workflow_dispatch:
+
+jobs:
+  shellcheck:
+    name: ShellCheck
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - name: Run ShellCheck
+        uses: ludeeus/action-shellcheck@master
+        with:
+          ignore: node_modules
+
+  shfmt:
+    name: shfmt
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - name: Run shfmt
+        uses: mfinelli/setup-shfmt@v3
+      - name: Check formatting
+        run: shfmt -d .

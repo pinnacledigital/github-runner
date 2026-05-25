@@ -1,10 +1,29 @@
 #!/bin/bash
 set -euo pipefail
 
-TOKEN_CACHE_FILE="${TOKEN_CACHE_DIR:-/var/run/github-runner}/token.cache"
+# --- Configuration ---
+TOKEN_CACHE_DIR="${TOKEN_CACHE_DIR:-/var/run/github-runner}"
+TOKEN_CACHE_FILE="${TOKEN_CACHE_DIR}/token.cache"
 TOKEN_MAX_AGE_SECONDS=3300  # 55 min — 5 min buffer before GitHub's 1-hour expiry
 
-mkdir -p "$(dirname "$TOKEN_CACHE_FILE")"
+mkdir -p "$TOKEN_CACHE_DIR"
+
+# --- GitHub App JWT Generation ---
+generate_jwt() {
+  local app_id=$1
+  local private_key=$2
+  
+  local header
+  header=$(echo -n '{"alg":"RS256","typ":"JWT"}' | openssl base64 | tr -d "\n" | tr -d '=' | tr '/+' '_-')
+  local payload
+  payload=$(echo -n "{\"iat\":$(($(date +%s) - 60)),\"exp\":$(($(date +%s) + 600)),\"iss\":\"${app_id}\"}" | openssl base64 | tr -d "\n" | tr -d '=' | tr '/+' '_-')
+  local signature
+  signature=$(echo -n "${header}.${payload}" | openssl dgst -sha256 -sign <(echo "$private_key") | openssl base64 | tr -d "\n" | tr -d '=' | tr '/+' '_-')
+  
+  echo "${header}.${payload}.${signature}"
+}
+
+# --- Token Management ---
 
 load_cached_token() {
   [ -f "$TOKEN_CACHE_FILE" ] || return 1
@@ -25,12 +44,50 @@ load_cached_token() {
   return 1
 }
 
+fetch_token_via_app() {
+  echo "[runner] Fetching token via GitHub App (ID: ${APP_ID})"
+  local jwt
+  jwt=$(generate_jwt "${APP_ID}" "${APP_PRIVATE_KEY}")
+  
+  # 1. Get Installation ID (if not provided)
+  if [ -z "${APP_INSTALLATION_ID:-}" ]; then
+    if [ "${RUNNER_SCOPE:-}" = "org" ]; then
+      APP_INSTALLATION_ID=$(curl -sf -H "Authorization: Bearer ${jwt}" \
+        -H "Accept: application/vnd.github+json" \
+        "https://api.github.com/orgs/${ORG_NAME}/installations" | jq -r '.[0].id')
+    else
+      local repo_path="${REPO_URL#https://github.com/}"
+      APP_INSTALLATION_ID=$(curl -sf -H "Authorization: Bearer ${jwt}" \
+        -H "Accept: application/vnd.github+json" \
+        "https://api.github.com/repos/${repo_path}/installations" | jq -r '.id')
+    fi
+  fi
+
+  # 2. Get Installation Access Token
+  local install_token
+  install_token=$(curl -sf -X POST \
+    -H "Authorization: Bearer ${jwt}" \
+    -H "Accept: application/vnd.github+json" \
+    "https://api.github.com/app/installations/${APP_INSTALLATION_ID}/access_tokens" | jq -r .token)
+
+  # 3. Get Registration Token
+  fetch_registration_token "$install_token"
+}
+
 fetch_token_via_pat() {
+  echo "[runner] Fetching token via PAT"
+  fetch_registration_token "$GITHUB_PAT"
+}
+
+fetch_registration_token() {
+  local auth_token=$1
+  local api_url
+  
   if [ "${RUNNER_SCOPE:-}" = "org" ]; then
-    API_URL="https://api.github.com/orgs/${ORG_NAME}/actions/runners/registration-token"
+    api_url="https://api.github.com/orgs/${ORG_NAME}/actions/runners/registration-token"
   elif [ -n "${REPO_URL:-}" ]; then
-    REPO_PATH="${REPO_URL#https://github.com/}"
-    API_URL="https://api.github.com/repos/${REPO_PATH}/actions/runners/registration-token"
+    local repo_path="${REPO_URL#https://github.com/}"
+    api_url="https://api.github.com/repos/${repo_path}/actions/runners/registration-token"
   else
     echo "ERROR: set RUNNER_SCOPE=org with ORG_NAME, or set REPO_URL" >&2
     return 1
@@ -38,12 +95,12 @@ fetch_token_via_pat() {
 
   local token
   token=$(curl -sf -X POST \
-    -H "Authorization: Bearer ${GITHUB_PAT}" \
+    -H "Authorization: Bearer ${auth_token}" \
     -H "Accept: application/vnd.github+json" \
-    "${API_URL}" | jq -r .token)
+    "${api_url}" | jq -r .token)
 
   if [ -z "$token" ] || [ "$token" = "null" ]; then
-    echo "ERROR: GitHub API returned no token — check GITHUB_PAT has admin:org scope" >&2
+    echo "ERROR: GitHub API returned no token" >&2
     return 1
   fi
 
@@ -52,26 +109,47 @@ fetch_token_via_pat() {
   export RUNNER_TOKEN
 }
 
-# --- Resolution order ---
+# --- Execution ---
 
-if [ -n "${GITHUB_PAT:-}" ]; then
-  echo "[runner] Mode: PAT rotation — fetching fresh registration token"
-  if fetch_token_via_pat; then
-    echo "[runner] Registration token acquired and cached"
-  else
-    echo "[runner] PAT fetch failed — attempting cached token fallback"
-    if ! load_cached_token; then
-      echo "ERROR: PAT fetch failed and no valid cached token available" >&2
-      exit 1
-    fi
+main() {
+  # 1. JIT Configuration (highest priority, bypasses myoung34 registration)
+  if [ -n "${JIT_CONFIG:-}" ]; then
+    echo "[runner] Mode: JIT Configuration — bypassing standard registration"
+    export DEBUG_ONLY=true
+    # Cleanup sensitive variables before starting the runner
+    unset GITHUB_PAT
+    unset APP_PRIVATE_KEY
+    # Execute via entrypoint but override the command to run jit config
+    exec /entrypoint.sh bash -c "./config.sh --jitconfig ${JIT_CONFIG} && ./run.sh"
   fi
-elif load_cached_token; then
-  echo "[runner] Mode: cached token from previous PAT rotation"
-elif [ -n "${RUNNER_TOKEN:-}" ]; then
-  echo "[runner] Mode: static RUNNER_TOKEN (expires 1 hour after generation)"
-else
-  echo "ERROR: no token source available — set GITHUB_PAT, provide a cached token, or set RUNNER_TOKEN" >&2
-  exit 1
-fi
 
-exec /entrypoint.sh "$@"
+  # 2. Static Token
+  if [ -n "${RUNNER_TOKEN:-}" ] && [ "${RUNNER_TOKEN:-}" != "null" ]; then
+    echo "[runner] Mode: Static RUNNER_TOKEN provided"
+  # 3. GitHub App
+  elif [ -n "${APP_ID:-}" ] && [ -n "${APP_PRIVATE_KEY:-}" ]; then
+    fetch_token_via_app || { load_cached_token || exit 1; }
+  # 4. PAT Rotation
+  elif [ -n "${GITHUB_PAT:-}" ]; then
+    fetch_token_via_pat || { load_cached_token || exit 1; }
+  # 5. Cache Fallback
+  elif load_cached_token; then
+    echo "[runner] Mode: Cached token fallback"
+  else
+    echo "ERROR: No token source available (JIT_CONFIG, RUNNER_TOKEN, APP_ID/KEY, or GITHUB_PAT)" >&2
+    exit 1
+  fi
+
+  # Cleanup sensitive variables before starting the runner
+  unset GITHUB_PAT
+  unset APP_PRIVATE_KEY
+  unset JIT_CONFIG
+
+  echo "[runner] Starting runner agent..."
+  exec /entrypoint.sh "$@"
+}
+
+# If we are not being sourced, run main
+if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
+  main "$@"
+fi
