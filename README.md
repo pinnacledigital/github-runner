@@ -227,6 +227,17 @@ all jobs run on `ubuntu-latest`.
 | `wait_if_busy` | no | `false` | When `true`, returns the requested labels even if all matching runners are busy, letting GitHub queue the job until one is free. When `false`, falls back immediately to `fallback` if no idle runner is found. |
 | `scope` | no | `auto` | Controls which API endpoint is queried. `auto` tries org-level first then falls back to repo-level. `org` queries org-level only and fails with an error if unreachable (use with a PAT). `repo` queries repo-level only and works with the default `github.token`. |
 
+### Input handling
+
+Inputs are normalized before use, so a value pasted into a GitHub form or saved from a Windows editor behaves like the clean value:
+leading and trailing whitespace (spaces, tabs, CR, LF) and a UTF-8 byte order mark are removed from every input, including the token.
+`labels` and `fallback` must be JSON arrays of strings; they are validated and written as compact one-line JSON, and anything else
+fails the step with an error that names the input. A blank `fallback`, `wait_if_busy` or `scope` means its default
+(`["ubuntu-latest"]`, `false`, `auto`); blank `labels` is an error.
+
+(Why: a repository variable saved as `["self-hosted","linux","x64"]` followed by CRLF used to make the step write extra lines to
+`$GITHUB_OUTPUT`, which GitHub rejects with `Invalid format ''` after the runner had already been matched.)
+
 ### Outputs
 
 | Output | Description |
