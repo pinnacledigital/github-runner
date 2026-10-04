@@ -76,6 +76,48 @@ runs:
         WAIT_IF_BUSY: ${{ inputs.wait_if_busy }}
         SCOPE: ${{ inputs.scope }}
       run: |
+        # Inputs are normalized once, here, before anything uses them. Values reach this script exactly as they were typed or pasted: a repository
+        # variable saved from a Windows editor carries CRLF, a form field carries stray spaces, a file may start with a byte order mark. A newline
+        # in a value is not cosmetic: `echo "runner=$LABELS" >> "$GITHUB_OUTPUT"` then writes extra lines, GitHub rejects the file ("Invalid
+        # format ''") after the runner was already matched, and the job fails. Whitespace also breaks the string comparisons below
+        # (`"true\r\n" != "true"` silently disables wait_if_busy).
+
+        # trim VALUE: VALUE without a leading UTF-8 byte order mark and without leading or trailing whitespace (spaces, tabs, CR, LF).
+        trim() {
+          local s="$1"
+          s="${s#$'\xEF\xBB\xBF'}"
+          s="${s#"${s%%[![:space:]]*}"}"
+          s="${s%"${s##*[![:space:]]}"}"
+          printf '%s' "$s"
+        }
+
+        # normalize_json_array INPUT_NAME VARIABLE: rewrites VARIABLE as compact single-line JSON. It must be a JSON array of strings; anything
+        # else fails the step with an error that names the input. Called directly (not in $(...)) so the error reaches the log and the exit
+        # ends the script.
+        normalize_json_array() {
+          local name="$1" var="$2" value out
+          value="$(trim "${!var}")"
+          out="$(printf '%s' "$value" | jq -ce 'if type == "array" and all(.[]; type == "string") then . else error("not an array of strings") end' 2>/dev/null)" || out=""
+          if [ -z "$out" ]; then
+            echo "::error::The '$name' input must be a JSON array of strings, for example [\"self-hosted\",\"linux\"] (got: $(printf '%s' "$value" | head -c 120 | tr -d '\r\n'))"
+            exit 1
+          fi
+          printf -v "$var" '%s' "$out"
+        }
+
+        GH_TOKEN="$(trim "${GH_TOKEN:-}")"
+        export GH_TOKEN
+        WAIT_IF_BUSY="$(trim "${WAIT_IF_BUSY:-}")"
+        SCOPE="$(trim "${SCOPE:-}")"
+        FALLBACK="$(trim "${FALLBACK:-}")"
+        # A blank optional input means "not set": the defaults declared in action.yml.
+        [ -n "$WAIT_IF_BUSY" ] || WAIT_IF_BUSY=false
+        [ -n "$SCOPE" ] || SCOPE=auto
+        [ -n "$FALLBACK" ] || FALLBACK='["ubuntu-latest"]'
+        LABELS="${LABELS:-}"
+        normalize_json_array labels LABELS
+        normalize_json_array fallback FALLBACK
+
         # If labels and fallback are identical there is nothing to check.
         if [ "$LABELS" = "$FALLBACK" ]; then
           echo "match_status=matched" >> "$GITHUB_OUTPUT"

@@ -19,5 +19,7 @@ jobs:
       - uses: actions/checkout@v6
       - name: Run runner-check tests
         run: bash test/runner-check.sh
+      - name: Run resolve-runner tests
+        run: bash test/resolve-runner.sh
       - name: Run token-rotation tests
         run: bash test/token-rotation.sh

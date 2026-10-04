@@ -26,6 +26,7 @@ This repository provides a robust, auto-scaling friendly GitHub Actions self-hos
 ### Testing
 The project includes a suite of shell unit tests to verify core logic without requiring a full Docker environment.
 - **Action Logic:** `bash test/runner-check.sh` (Tests the `jq` matching logic in the `runner-check` action).
+- **Input normalization:** `bash test/resolve-runner.sh` (Runs the action's real script, extracted from `action.yml`, against a fake `gh`: whitespace, CRLF, BOM, malformed JSON, defaults.)
 - **Registration Logic:** `bash test/token-rotation.sh` (Tests `token-entrypoint.sh` caching and lifecycle management).
 
 ### Linting & Formatting
