@@ -86,10 +86,13 @@ example. Rename the service and set the env vars to match your org:
 ```yaml
 services:
   github-runner-myorg-1:
-    image: github-runner-android:local
-    build:
-      context: .
-      dockerfile: Dockerfile.android   # emulator image; use `build: .` for the base image
+    image: ghcr.io/pinnacledigital/github-runner:latest
+    # Emulator image: swap in this image and the commented build block below
+    # image: ghcr.io/pinnacledigital/github-runner-android-emulator:latest
+    build: .
+    # build:
+    #   context: .
+    #   dockerfile: Dockerfile.android
     restart: always
     environment:
       RUNNER_SCOPE: org          # 'org' for org-level, 'repo' for repo-level
@@ -99,14 +102,14 @@ services:
       LABELS: self-hosted,linux,amd64,android
       EPHEMERAL: "true"
     devices:
-      - /dev/kvm                 # emulator: KVM access
+      - /dev/kvm                 # emulator: KVM access (unused by the base image)
 ```
 
-The `devices` line and the `Dockerfile.android` build are what enable the
-Android emulator; see
-[Android emulator support (KVM)](#android-emulator-support-kvm). If the runner
-only builds APKs, drop the `devices` line and use `build: .` with
-`image: ghcr.io/pinnacledigital/github-runner:latest`.
+The service uses the base image by default. For emulator-based jobs (such as
+Maestro UI tests), switch to the emulator image: swap the `image:` line and the
+`build:` block for the commented alternatives. The `devices` line maps KVM into
+the container for the emulator and is harmless otherwise; see
+[Android emulator support (KVM)](#android-emulator-support-kvm).
 
 Each service registers as a separate runner. One runner handles one job at a
 time — add more service blocks (with distinct `RUNNER_NAME` values) for
@@ -114,28 +117,35 @@ parallelism within the same org.
 
 ### 4. Start the runner
 
-**Emulator image (default in `docker-compose.yml`)**
+Both images are published to GHCR automatically on every push to `master`:
 
-```bash
-docker compose up -d --build
-```
+| Image | Use it for |
+|---|---|
+| `ghcr.io/pinnacledigital/github-runner` | APK builds (default in `docker-compose.yml`) |
+| `ghcr.io/pinnacledigital/github-runner-android-emulator` | Emulator-based jobs; the base image plus the emulator libraries |
 
-The emulator image is built locally from `Dockerfile.android` (tagged
-`github-runner-android:local`). It layers on top of the base image, so Docker
-first pulls `ghcr.io/pinnacledigital/github-runner:latest`, which is built and
-published automatically on every push to `master`.
+Both carry the same tags: `latest`, the branch name, version tags and
+`sha-<short>`.
 
-**Base image only (APK builds, no emulator)**
-
-Set the service to `image: ghcr.io/pinnacledigital/github-runner:latest` with
-`build: .`, remove the KVM settings, then:
+**Use the published image (fastest)**
 
 ```bash
 docker compose pull
 docker compose up -d
 ```
 
-`--build` forces a local rebuild of either image.
+**Build locally**
+
+```bash
+docker compose up -d --build
+```
+
+`image:` and `build:` coexist in the compose file, so `--build` builds from
+`Dockerfile` (or `Dockerfile.android` if you switched to the commented block)
+and tags the result with the `image:` name. The emulator image is built `FROM`
+the base image, so a local emulator build first pulls
+`ghcr.io/pinnacledigital/github-runner:latest` (or build the base first with
+`docker build -t ghcr.io/pinnacledigital/github-runner:latest .`).
 
 ### 5. Verify registration
 
@@ -409,3 +419,61 @@ dependencies change:
 docker compose build --no-cache
 docker compose up -d
 ```
+
+### Automatic rebuilds on new base-image releases
+
+Published images record the upstream runner version they were built on, in the
+label `io.github.pinnacledigital.upstream.runner-version` (and the base image
+digest in `...upstream.image-digest`). `docker-publish.yml` resolves the upstream
+`myoung34/github-runner:latest` image once, builds on exactly that digest, and
+writes both labels. The `github-runner-android-emulator` image inherits them. To see them:
+
+```bash
+docker image inspect ghcr.io/pinnacledigital/github-runner:latest \
+  --format '{{index .Config.Labels "io.github.pinnacledigital.upstream.runner-version"}}'
+```
+
+The `Monitor base image release` workflow
+(`.github/workflows/monitor-base-image.yml`) runs every 3 days and on demand. It
+compares the latest release of
+[`myoung34/docker-github-actions-runner`](https://github.com/myoung34/docker-github-actions-runner)
+with the label on our published image. If they differ, and Docker Hub's `:latest`
+has been rebuilt since that release, it dispatches `docker-publish.yml`, which
+rebuilds the base image and then the `github-runner-android-emulator` image on top
+of it.
+
+- **Why it matters:** runners self-update when their version is behind the
+  latest release, and an interrupted self-update inside a container leaves it
+  crash-looping. Rebuilding on the current base avoids that.
+- **No separate state:** the published image's label is the record of what has
+  been built. If a rebuild fails or has not finished, the label stays stale and
+  the next run tries again. An image published before the label existed counts as
+  out of date, so the first run after adding it triggers one rebuild.
+- **Manual run:** *Actions → Monitor base image release → Run workflow*. Tick
+  **force** to rebuild even if the published image is already current.
+- **After a rebuild,** pull and recreate the runner containers to pick up the
+  new images: `docker compose pull && docker compose up -d --force-recreate`.
+- **GitHub disables scheduled workflows** after 60 days without repository
+  activity; re-enable it from the Actions tab if that happens.
+
+### Runner selection for this repository's own workflows
+
+`docker-publish.yml` and `monitor-base-image.yml` dogfood the resolver action in
+this repo (`uses: ./`). Each starts with a small job on a GitHub-hosted runner
+that picks an idle self-hosted runner if there is one, and otherwise falls back
+to `ubuntu-latest` immediately (`wait_if_busy: 'false'`; it never queues behind
+a busy runner). The emulator-image build resolves again right before it starts,
+because the runner is ephemeral and the first job may have used it.
+
+- **Labels** default to `["self-hosted","linux","amd64"]`; override with the
+  `RUNNER_LABELS` repository variable.
+- **Org-level runners need a token that can list them.** Add an `ORG_RUNNER_PAT`
+  secret (classic PAT with `admin:org`). Without it the resolver cannot see
+  org-level runners and always falls back to `ubuntu-latest`, which is safe but
+  never uses your runners.
+- **This is a public repository.** GitHub's runner groups do not allow public
+  repositories by default, so enable **Allow public repositories** for the
+  runner group, or a job that resolves to your runner will sit queued instead of
+  falling back. Only run trusted code there: both workflows trigger on `push`,
+  `schedule` and `workflow_dispatch`, never on `pull_request`, so forks cannot
+  run code on the runner. Keep it that way.

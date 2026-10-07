@@ -1,9 +1,14 @@
 services:
   github-runner-myorg-1:
-    image: github-runner-android:local
+    image: ghcr.io/pinnacledigital/github-runner:latest
+    # Android emulator image (Dockerfile.android: base + emulator libraries).
+    # To use it, swap the image above for this one and the build block below
+    # for the commented one:
+    # image: ghcr.io/pinnacledigital/github-runner-android-emulator:latest
     build:
-      context: .
-      dockerfile: Dockerfile.android
+       context: .
+       dockerfile: Dockerfile
+    #   dockerfile: Dockerfile.android
     restart: always
     environment:
       RUNNER_SCOPE: org
@@ -20,7 +25,7 @@ services:
       - runner-state:/var/run/github-runner
 
     # The Android emulator needs KVM: map the host device (host must be Linux
-    # with /dev/kvm)
+    # with /dev/kvm). Harmless for the base image, which does not use it.
     devices:
       - /dev/kvm
 

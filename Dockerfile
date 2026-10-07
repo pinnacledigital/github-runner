@@ -1,4 +1,7 @@
-FROM myoung34/github-runner:latest
+# The workflow pins this to an exact digest and records what it resolved in the
+# labels below, so the published image says which upstream it was built from.
+ARG BASE_IMAGE=myoung34/github-runner:latest
+FROM ${BASE_IMAGE}
 
 ENV DEBIAN_FRONTEND=noninteractive
 ENV ANDROID_HOME=/opt/android/sdk
@@ -54,6 +57,15 @@ RUN yes | sdkmanager --licenses > /dev/null 2>&1 || true && \
 
 # Gradle cache dir with open permissions so runner user can write
 RUN mkdir -p /root/.gradle && chmod 777 /root/.gradle
+
+# Record which upstream (myoung34/github-runner) this image was built on. Set
+# by docker-publish.yml; monitor-base-image.yml compares the runner version
+# against the latest upstream release to decide whether a rebuild is needed.
+# Declared late so changing the values does not invalidate earlier layers.
+ARG UPSTREAM_RUNNER_VERSION=unknown
+ARG UPSTREAM_IMAGE_DIGEST=unknown
+LABEL io.github.pinnacledigital.upstream.runner-version="${UPSTREAM_RUNNER_VERSION}" \
+      io.github.pinnacledigital.upstream.image-digest="${UPSTREAM_IMAGE_DIGEST}"
 
 # Token rotation entrypoint
 COPY token-entrypoint.sh /token-entrypoint.sh

@@ -1,0 +1,133 @@
+name: Monitor base image release
+
+# Watches myoung34/docker-github-actions-runner (the upstream of our
+# `FROM myoung34/github-runner` base). Our published image carries the upstream
+# runner version it was built on as a label (set by docker-publish.yml). When the
+# latest upstream release differs from that label, and Docker Hub's :latest has
+# been rebuilt since the release, this dispatches docker-publish.yml, which
+# rebuilds both of our images (base, then the android-emulator image on top of it).
+#
+# The published image is the only state: a failed or pending rebuild simply
+# leaves the label stale, so the next run tries again.
+
+on:
+  schedule:
+    # 00:00 every 3 days
+    - cron: '0 0 */3 * *'
+  workflow_dispatch:
+    inputs:
+      force:
+        description: 'Rebuild even if the published image is already up to date'
+        type: boolean
+        default: false
+
+concurrency:
+  group: monitor-base-image
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  packages: read
+  actions: write # needed to dispatch docker-publish.yml
+
+env:
+  UPSTREAM_REPO: myoung34/docker-github-actions-runner
+  UPSTREAM_IMAGE: myoung34/github-runner
+  LABEL: io.github.pinnacledigital.upstream.runner-version
+
+jobs:
+  check-runner:
+    name: Resolve runner
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: read
+    outputs:
+      runner: ${{ steps.check.outputs.runner }}
+    steps:
+      - uses: actions/checkout@v6
+
+      # Dogfooding: use this repo's own resolver action. Prefer an idle
+      # self-hosted runner; never wait for a busy one — fall back to
+      # GitHub-hosted instead. Without an org-scoped PAT the runners API cannot
+      # list org-level runners, so this simply falls back to ubuntu-latest.
+      - name: Check runner availability
+        id: check
+        uses: ./
+        with:
+          labels: ${{ vars.RUNNER_LABELS || '["self-hosted","linux","amd64"]' }}
+          token: ${{ secrets.ORG_RUNNER_PAT || github.token }}
+          wait_if_busy: 'false'
+          scope: auto
+
+  check-and-trigger:
+    name: Check for new base release
+    needs: check-runner
+    runs-on: ${{ fromJSON(needs.check-runner.outputs.runner) }}
+    steps:
+      - name: Get latest upstream release
+        id: release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          json="$(gh api "repos/${UPSTREAM_REPO}/releases/latest")"
+          tag="$(jq -r .tag_name <<<"$json")"
+          # Release tags are versions like 2.338.0; refuse anything else.
+          [[ "$tag" =~ ^v?[0-9]+(\.[0-9]+)+$ ]] || { echo "::error::Unexpected release tag: $tag"; exit 1; }
+          echo "version=${tag#v}" >> "$GITHUB_OUTPUT"
+          echo "published=$(jq -r .published_at <<<"$json")" >> "$GITHUB_OUTPUT"
+          echo "Latest upstream release: ${tag#v}"
+
+      - name: Read upstream version from our published image
+        id: ours
+        env:
+          IMAGE: ghcr.io/${{ github.repository }}:latest
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          command -v skopeo >/dev/null || { sudo apt-get update -qq && sudo apt-get install -y -qq skopeo; }
+          # An image published before the label existed has none; that counts
+          # as out of date (empty), which triggers one rebuild that adds it.
+          have="$(skopeo inspect --creds "${GITHUB_ACTOR}:${GH_TOKEN}" "docker://${IMAGE}" \
+            | jq -r --arg l "$LABEL" '.Labels[$l] // ""')"
+          echo "version=$have" >> "$GITHUB_OUTPUT"
+          echo "Published ${IMAGE} was built on upstream runner: ${have:-<no label>}"
+
+      - name: Decide whether to rebuild
+        id: decide
+        env:
+          RELEASE: ${{ steps.release.outputs.version }}
+          HAVE: ${{ steps.ours.outputs.version }}
+          PUBLISHED: ${{ steps.release.outputs.published }}
+          FORCE: ${{ inputs.force }}
+        run: |
+          set -euo pipefail
+          if [ "$HAVE" = "$RELEASE" ] && [ "$FORCE" != "true" ]; then
+            echo "Published image is already on upstream $RELEASE; nothing to do."
+            echo "rebuild=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          # :latest on Docker Hub is rebuilt separately from the GitHub release.
+          # Only proceed once it was built after the release was published;
+          # otherwise we would rebuild on the old base. No state is recorded, so
+          # the next scheduled run simply checks again.
+          updated="$(curl -fsS "https://hub.docker.com/v2/repositories/${UPSTREAM_IMAGE}/tags/latest" | jq -r .last_updated)"
+          echo "Docker Hub ${UPSTREAM_IMAGE}:latest last updated $updated"
+          if [ "$(date -d "$updated" +%s)" -ge "$(date -d "$PUBLISHED" +%s)" ]; then
+            echo "New upstream release $RELEASE (published image has: ${HAVE:-none}); rebuilding."
+            echo "rebuild=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "::notice::Docker Hub :latest predates release $RELEASE; will retry on the next run"
+            echo "rebuild=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Trigger image rebuild
+        if: steps.decide.outputs.rebuild == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          # docker-publish.yml builds the base image, then the android-emulator
+          # image (a separate package) on top of it, from the default branch.
+          gh workflow run docker-publish.yml --repo "$GITHUB_REPOSITORY" --ref "$DEFAULT_BRANCH"

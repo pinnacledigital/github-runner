@@ -5,6 +5,7 @@ on:
     branches: [master]
     paths:
       - Dockerfile
+      - Dockerfile.android
       - token-entrypoint.sh
     tags:
       - 'v*'
@@ -16,12 +17,40 @@ env:
   IMAGE_NAME: ${{ github.repository }}
 
 jobs:
-  build-and-push:
-    name: Build and push
+  check-runner:
+    name: Resolve runner
     runs-on: ubuntu-latest
     permissions:
       contents: read
+      actions: read
+    outputs:
+      runner: ${{ steps.check.outputs.runner }}
+    steps:
+      - uses: actions/checkout@v6
+
+      # Dogfooding: use this repo's own resolver action. Prefer an idle
+      # self-hosted runner; never wait for a busy one — fall back to
+      # GitHub-hosted instead. Without an org-scoped PAT the runners API cannot
+      # list org-level runners, so this simply falls back to ubuntu-latest.
+      - name: Check runner availability
+        id: check
+        uses: ./
+        with:
+          labels: ${{ vars.RUNNER_LABELS || '["self-hosted","linux","amd64"]' }}
+          token: ${{ secrets.ORG_RUNNER_PAT || github.token }}
+          wait_if_busy: 'false'
+          scope: auto
+
+  build-and-push:
+    name: Build and push
+    needs: check-runner
+    runs-on: ${{ fromJSON(needs.check-runner.outputs.runner) }}
+    permissions:
+      contents: read
       packages: write
+    outputs:
+      # Digest of the base image just pushed; the emulator image builds on it
+      digest: ${{ steps.build.outputs.digest }}
 
     steps:
       - uses: actions/checkout@v6
@@ -53,13 +82,117 @@ jobs:
             # short SHA for traceability
             type=sha,prefix=sha-
 
+      # Resolve the upstream image once, so the build uses exactly this image and
+      # the labels describe it truthfully. monitor-base-image.yml reads the
+      # runner-version label from the published image to decide when to rebuild.
+      - name: Resolve upstream base image
+        id: upstream
+        run: |
+          set -euo pipefail
+          image=myoung34/github-runner:latest
+          docker pull "$image"
+          digest="$(docker image inspect "$image" --format '{{index .RepoDigests 0}}' | cut -d@ -f2)"
+          version="$(docker run --rm --entrypoint /actions-runner/bin/Runner.Listener "$image" --version | tr -d '[:space:]')"
+          [[ "$version" =~ ^[0-9]+(\.[0-9]+)+$ ]] || { echo "::error::Unexpected runner version: $version"; exit 1; }
+          echo "digest=$digest" >> "$GITHUB_OUTPUT"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "Upstream: runner $version ($digest)"
+
       - name: Build and push
+        id: build
         uses: docker/build-push-action@v6
         with:
           context: .
           push: true
+          build-args: |
+            BASE_IMAGE=myoung34/github-runner@${{ steps.upstream.outputs.digest }}
+            UPSTREAM_RUNNER_VERSION=${{ steps.upstream.outputs.version }}
+            UPSTREAM_IMAGE_DIGEST=${{ steps.upstream.outputs.digest }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           # Layer cache via GitHub Actions cache — speeds up incremental builds
           cache-from: type=gha
           cache-to: type=gha,mode=max
+
+  # Emulator image (Dockerfile.android): the base image plus the libraries the
+  # Android emulator needs. Built after the base image so it layers on exactly
+  # what was just pushed.
+  # Re-resolve right before the emulator build: the first job may have used the
+  # only self-hosted runner, which is ephemeral and re-registering by now.
+  check-runner-android:
+    name: Resolve runner (emulator image)
+    runs-on: ubuntu-latest
+    needs: build-and-push
+    permissions:
+      contents: read
+      actions: read
+    outputs:
+      runner: ${{ steps.check.outputs.runner }}
+    steps:
+      - uses: actions/checkout@v6
+
+      # Dogfooding: use this repo's own resolver action. Prefer an idle
+      # self-hosted runner; never wait for a busy one — fall back to
+      # GitHub-hosted instead. Without an org-scoped PAT the runners API cannot
+      # list org-level runners, so this simply falls back to ubuntu-latest.
+      - name: Check runner availability
+        id: check
+        uses: ./
+        with:
+          labels: ${{ vars.RUNNER_LABELS || '["self-hosted","linux","amd64"]' }}
+          token: ${{ secrets.ORG_RUNNER_PAT || github.token }}
+          wait_if_busy: 'false'
+          scope: auto
+
+  build-and-push-android:
+    name: Build and push (android-emulator image)
+    needs: [build-and-push, check-runner-android]
+    runs-on: ${{ fromJSON(needs.check-runner-android.outputs.runner) }}
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          # Separate package from the base image, so the standard tags below mean
+          # the same thing for both: ghcr.io/<repo>-android-emulator:latest etc.
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}-android-emulator
+          tags: |
+            # :latest on every push to master
+            type=raw,value=latest,enable={{is_default_branch}}
+            # :master (or whichever branch)
+            type=ref,event=branch
+            # :v1.2.3 and :v1.2 and :v1 on semver tags
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=semver,pattern={{major}}
+            # short SHA for traceability
+            type=sha,prefix=sha-
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile.android
+          build-args: |
+            BASE_IMAGE=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@${{ needs.build-and-push.outputs.digest }}
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha,scope=android-emulator
+          cache-to: type=gha,scope=android-emulator,mode=max
