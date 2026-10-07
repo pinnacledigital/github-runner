@@ -39,6 +39,19 @@ RUN yes | sdkmanager --licenses > /dev/null 2>&1 || true && \
       "platforms;android-35" \
       "ndk;27.1.12297006"
 
+# Android SDK 36 platform + build-tools (used by android-build.yml), and
+# cmdline-tools 20.0. The cmdline-tools zip above installs into .../latest,
+# which is on PATH, so repoint "latest" at 20.0 once it is installed.
+# Kept as its own layer so the NDK layer above stays cached.
+RUN yes | sdkmanager --licenses > /dev/null 2>&1 || true && \
+    sdkmanager \
+      "cmdline-tools;20.0" \
+      "platforms;android-36" \
+      "build-tools;36.0.0" && \
+    rm -rf ${ANDROID_HOME}/cmdline-tools/latest && \
+    ln -s 20.0 ${ANDROID_HOME}/cmdline-tools/latest && \
+    sdkmanager --version
+
 # Gradle cache dir with open permissions so runner user can write
 RUN mkdir -p /root/.gradle && chmod 777 /root/.gradle
 

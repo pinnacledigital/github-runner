@@ -1,7 +1,9 @@
 services:
   github-runner-myorg-1:
-    image: ghcr.io/pinnacledigital/github-runner:latest
-    build: .
+    image: github-runner-android:local
+    build:
+      context: .
+      dockerfile: Dockerfile.android
     restart: always
     environment:
       RUNNER_SCOPE: org
@@ -16,6 +18,11 @@ services:
       - gradle-wrapper:/root/.gradle/wrapper
       - npm-cache:/root/.npm
       - runner-state:/var/run/github-runner
+
+    # The Android emulator needs KVM: map the host device (host must be Linux
+    # with /dev/kvm)
+    devices:
+      - /dev/kvm
 
   # Add one service block per additional org or repo.
   # Each service needs its own ORG_NAME env var — add a distinct variable

@@ -12,10 +12,17 @@ on every run.
 | GitHub Actions runner | latest (`myoung34/github-runner`) |
 | Java | Temurin 17 |
 | Node.js | 24 |
-| Android SDK command-line tools | 12266719 |
-| Android build-tools | 35.0.0 |
-| Android platform | 35 |
+| Android SDK command-line tools | 20.0 |
+| Android build-tools | 35.0.0, 36.0.0 |
+| Android platforms | 35, 36 |
 | Android NDK | 27.1.12297006 |
+
+The repository builds two images:
+
+| Image | Dockerfile | Use it for |
+|---|---|---|
+| Base | `Dockerfile` | Everything above. Enough to build APKs. |
+| Android emulator | `Dockerfile.android` | The base image plus the libraries the Android emulator needs. Use it for emulator-based jobs such as [Maestro](https://maestro.dev) UI tests. See [Android emulator support (KVM)](#android-emulator-support-kvm). |
 
 Gradle and npm caches are persisted in named Docker volumes across runs,
 significantly reducing build times after the first run.
@@ -79,7 +86,10 @@ example. Rename the service and set the env vars to match your org:
 ```yaml
 services:
   github-runner-myorg-1:
-    build: .
+    image: github-runner-android:local
+    build:
+      context: .
+      dockerfile: Dockerfile.android   # emulator image; use `build: .` for the base image
     restart: always
     environment:
       RUNNER_SCOPE: org          # 'org' for org-level, 'repo' for repo-level
@@ -88,7 +98,15 @@ services:
       RUNNER_NAME: amd64-${ORG_NAME}-1
       LABELS: self-hosted,linux,amd64,android
       EPHEMERAL: "true"
+    devices:
+      - /dev/kvm                 # emulator: KVM access
 ```
+
+The `devices` line and the `Dockerfile.android` build are what enable the
+Android emulator; see
+[Android emulator support (KVM)](#android-emulator-support-kvm). If the runner
+only builds APKs, drop the `devices` line and use `build: .` with
+`image: ghcr.io/pinnacledigital/github-runner:latest`.
 
 Each service registers as a separate runner. One runner handles one job at a
 time — add more service blocks (with distinct `RUNNER_NAME` values) for
@@ -96,30 +114,111 @@ parallelism within the same org.
 
 ### 4. Start the runner
 
-**Option A — use the pre-built image from GHCR (fastest)**
+**Emulator image (default in `docker-compose.yml`)**
+
+```bash
+docker compose up -d --build
+```
+
+The emulator image is built locally from `Dockerfile.android` (tagged
+`github-runner-android:local`). It layers on top of the base image, so Docker
+first pulls `ghcr.io/pinnacledigital/github-runner:latest`, which is built and
+published automatically on every push to `master`.
+
+**Base image only (APK builds, no emulator)**
+
+Set the service to `image: ghcr.io/pinnacledigital/github-runner:latest` with
+`build: .`, remove the KVM settings, then:
 
 ```bash
 docker compose pull
 docker compose up -d
 ```
 
-The `docker-compose.yml` references `ghcr.io/pinnacledigital/github-runner:latest`,
-which is built and published automatically on every push to `master`.
-
-**Option B — build the image locally**
-
-```bash
-docker compose up -d --build
-```
-
-Both options are always available — `image:` and `build:` coexist in the
-compose file. `--build` forces a local rebuild regardless of whether a pulled
-image exists.
+`--build` forces a local rebuild of either image.
 
 ### 5. Verify registration
 
 Go to **GitHub → Org Settings → Actions → Runners** — the runner should appear
 as idle within 30 seconds.
+
+## Android emulator support (KVM)
+
+APK builds only need the toolchain in the base image. Emulator-based jobs, such
+as Maestro UI tests that boot an Android emulator, additionally need hardware
+virtualization (KVM) and a set of display/audio libraries. Without them the
+emulator either refuses to start or hangs silently during boot.
+
+### What the compose changes do
+
+The only compose change the emulator needs is mapping the host's KVM device
+into the container:
+
+```yaml
+devices:
+  - /dev/kvm
+```
+
+A device is a runtime property of the container, so it cannot be baked into an
+image. Mapping it is sufficient: neither `privileged: true` nor a larger
+`shm_size` is required. This was tested with the E2E Maestro workflow (API 34
+x86_64 `google_apis` emulator, 4 cores, 4 GB RAM) with `privileged` off and
+`/dev/shm` left at Docker's 64 MB default; the emulator booted and the flow
+passed on the self-hosted runner. Each configuration was run once. A
+browser-based or otherwise shared-memory-heavy job on the same runner may still
+want `shm_size` raised.
+
+The runner process runs as root inside the container, so no extra group
+membership is needed to open `/dev/kvm`. If you change the image to run as a
+non-root user, also add the host's `kvm` group with `group_add: ["<GID>"]`
+(find it with `getent group kvm`).
+
+### What `Dockerfile.android` adds
+
+`Dockerfile.android` is `FROM` the base image and installs only what the
+emulator needs on top of it:
+
+- Headless X11/GL/audio libraries (`libx11-xcb1`, `libxkbcommon0`, `libgl1`,
+  `libegl1`, `libpulse0`, `libnss3`, and related). The emulator's software
+  renderer (`-gpu swiftshader_indirect`) loads these at startup and aborts
+  without them, with no clear error in the job log.
+- `$ANDROID_HOME/emulator` on `PATH`.
+
+It leaves the entrypoint (`token-entrypoint.sh`) and command untouched, so token
+rotation and ephemeral re-registration behave the same as in the base image. The
+emulator binary and system image themselves are downloaded by the workflow (for
+example by `reactivecircus/android-emulator-runner`).
+
+### Host requirements
+
+- A **Linux** host whose CPU supports virtualization (`vmx`/`svm` in
+  `/proc/cpuinfo`) with `/dev/kvm` present. Docker Desktop on macOS and Windows
+  does not provide `/dev/kvm`, so the emulator image cannot run emulators there.
+- An x86_64 CPU; the workflow's emulator must be an x86_64 system image.
+
+### Verify KVM inside the container
+
+```bash
+docker compose exec github-runner-myorg-1 sh -c 'test -r /dev/kvm -a -w /dev/kvm && echo KVM OK'
+```
+
+Workflows can probe it the same way before choosing a runner; a job can fall
+back to a GitHub-hosted runner when `/dev/kvm` is not accessible.
+
+### Troubleshooting
+
+- **Runner never takes the emulator job and the workflow falls back to
+  `ubuntu-latest`:** no runner with the requested labels is online. Check
+  `docker compose ps` and `docker compose logs`.
+- **Containers keep restarting after `.env` changes:** containers keep the
+  environment they were created with. Run
+  `docker compose up -d --force-recreate` rather than `docker compose restart`.
+- **Containers crash-loop with `Runner.Listener: No such file or directory`:**
+  a runner self-update (the runner updates itself when its version is behind)
+  was interrupted and left a broken install, and `restart: always` reuses that
+  container. Rebuild the base image from a current `myoung34/github-runner`
+  (`docker pull myoung34/github-runner:latest`, then
+  `docker compose build --no-cache`) and recreate the containers.
 
 ## Using the runner in workflows
 
@@ -302,7 +401,9 @@ running `docker compose up -d` to restart affected services.
 
 ## Updating the toolchain
 
-To update SDK versions, edit the `Dockerfile` and rebuild:
+To update SDK versions, edit the `Dockerfile` and rebuild. `Dockerfile.android`
+inherits the SDK from the base image, so it only needs editing when the emulator
+dependencies change:
 
 ```bash
 docker compose build --no-cache

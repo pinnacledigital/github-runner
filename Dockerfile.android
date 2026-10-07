@@ -1,0 +1,27 @@
+# Emulator runner image for Maestro/Android emulator workflows. Layers on the
+# base runner image (Dockerfile), which already provides Java 17, Node, the
+# Android SDK/NDK, SDK 36 and token-entrypoint — enough to build APKs. This
+# file only adds what the emulator needs on top.
+#
+# /dev/kvm cannot be baked into an image: it is a host device and must be
+# mapped at run time (docker-compose: privileged + devices: /dev/kvm). The host
+# must be Linux with KVM — Docker Desktop on macOS has no /dev/kvm.
+ARG BASE_IMAGE=ghcr.io/pinnacledigital/github-runner:latest
+FROM ${BASE_IMAGE}
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+# Headless X11/GL libraries for the Android emulator's swiftshader/gfxstream
+# renderer. Without them the emulator's Vulkan loader dlopen-fails every libX11
+# variant and QEMU never opens the adb port (silent boot failure in the job log).
+# The base image is Ubuntu 20.04 (focal), so the ALSA package is libasound2.
+# qemu-kvm is not needed: the emulator ships its own QEMU.
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+      libx11-6 libxext6 libxcb1 libx11-xcb1 libxrender1 libxkbcommon0 \
+      libgl1 libegl1 libpulse0 libnss3 libasound2 && \
+    rm -rf /var/lib/apt/lists/*
+
+# The emulator binary itself is installed by the workflow
+# (reactivecircus/android-emulator-runner); this just puts it on PATH.
+ENV PATH="${ANDROID_HOME}/emulator:${PATH}"
